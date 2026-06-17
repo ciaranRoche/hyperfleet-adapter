@@ -9,6 +9,7 @@ import (
 
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/configloader"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/criteria"
+	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/desireclient"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/maestroclient"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/manifest"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/transportclient"
@@ -22,19 +23,34 @@ import (
 
 // ResourceExecutor creates and updates Kubernetes resources
 type ResourceExecutor struct {
-	client  transportclient.TransportClient
-	log     logger.Logger
-	metrics *metrics.Recorder
+	client     transportclient.TransportClient
+	transports map[string]transportclient.TransportClient
+	log        logger.Logger
+	metrics    *metrics.Recorder
 }
 
 // newResourceExecutor creates a new resource executor
 // NOTE: Caller (NewExecutor) is responsible for config validation
 func newResourceExecutor(config *ExecutorConfig) *ResourceExecutor {
 	return &ResourceExecutor{
-		client:  config.TransportClient,
-		log:     config.Logger,
-		metrics: config.MetricsRecorder,
+		client:     config.TransportClient,
+		transports: config.TransportRegistry,
+		log:        config.Logger,
+		metrics:    config.MetricsRecorder,
 	}
+}
+
+// resolveTransport returns the transport client for a resource.
+// Looks up the resource's transport client type (e.g., "desire", "kubernetes")
+// in the transport registry. Falls back to the default transport client.
+func (re *ResourceExecutor) resolveTransport(resource configloader.Resource) transportclient.TransportClient {
+	if re.transports != nil && resource.Transport != nil {
+		clientType := resource.Transport.Client
+		if tc, ok := re.transports[clientType]; ok {
+			return tc
+		}
+	}
+	return re.client
 }
 
 // ExecuteAll creates/updates all resources in sequence
@@ -99,14 +115,14 @@ func (re *ResourceExecutor) executeResource(
 		Status: StatusSuccess,
 	}
 
-	transportClient := re.client
+	transportClient := re.resolveTransport(resource)
 	if transportClient == nil {
 		result.Status = StatusFailed
 		result.Error = fmt.Errorf("transport client not configured for %s", resource.GetTransportClient())
 		return result, NewExecutorError(PhaseResources, resource.Name, "transport client not configured", result.Error)
 	}
 
-	// Step 1: Build transport context (nil for k8s, *maestroclient.TransportContext for maestro).
+	// Step 1: Build transport context (nil for k8s, typed context for maestro/desire).
 	// Done first so it is available for both the lifecycle delete path and the apply path.
 	var transportTarget transportclient.TransportContext
 	if resource.IsMaestroTransport() && resource.Transport.Maestro != nil {
@@ -118,6 +134,16 @@ func (re *ResourceExecutor) executeResource(
 		}
 		transportTarget = &maestroclient.TransportContext{
 			ConsumerName: targetCluster,
+		}
+	} else if resource.IsDesireTransport() && resource.Transport.Desire != nil {
+		targetCluster, tplErr := utils.RenderTemplate(resource.Transport.Desire.TargetCluster, execCtx.Params)
+		if tplErr != nil {
+			result.Status = StatusFailed
+			result.Error = tplErr
+			return result, NewExecutorError(PhaseResources, resource.Name, "failed to render targetCluster template", tplErr)
+		}
+		transportTarget = &desireclient.TransportContext{
+			Partition: targetCluster,
 		}
 	}
 
@@ -274,6 +300,7 @@ func (re *ResourceExecutor) renderToBytes(
 // discoverResource discovers the applied resource using the discovery config.
 // For k8s transport: discovers the K8s resource by name or label selector.
 // For maestro transport: discovers the ManifestWork by name or label selector.
+// For desire transport: discovers via ReadDesire status from the desire store.
 // The discovered resource is stored in execCtx.Resources for post-action CEL evaluation.
 func (re *ResourceExecutor) discoverResource(
 	ctx context.Context,
@@ -284,6 +311,12 @@ func (re *ResourceExecutor) discoverResource(
 	discovery := resource.Discovery
 	if discovery == nil {
 		return nil, nil
+	}
+
+	// Resolve which transport client to use for discovery
+	discoverClient := re.resolveTransport(resource)
+	if discoverClient == nil {
+		discoverClient = re.client
 	}
 
 	// Render discovery namespace template
@@ -303,7 +336,7 @@ func (re *ResourceExecutor) discoverResource(
 		// For k8s: parse the rendered manifest to get GVK
 		gvk := re.resolveGVK(resource)
 
-		return re.client.GetResource(ctx, gvk, namespace, name, transportTarget)
+		return discoverClient.GetResource(ctx, gvk, namespace, name, transportTarget)
 	}
 
 	// Discover by label selector
@@ -329,7 +362,7 @@ func (re *ResourceExecutor) discoverResource(
 
 		gvk := re.resolveGVK(resource)
 
-		list, err := re.client.DiscoverResources(ctx, gvk, discoveryConfig, transportTarget)
+		list, err := discoverClient.DiscoverResources(ctx, gvk, discoveryConfig, transportTarget)
 		if err != nil {
 			return nil, err
 		}
@@ -510,6 +543,14 @@ func (re *ResourceExecutor) preDiscoverAll(
 				return NewExecutorError(PhaseResources, resource.Name, "failed to render targetCluster", err)
 			}
 			transportTarget = &maestroclient.TransportContext{ConsumerName: targetCluster}
+		} else if resource.IsDesireTransport() && resource.Transport.Desire != nil {
+			targetCluster, err := utils.RenderTemplate(resource.Transport.Desire.TargetCluster, execCtx.Params)
+			if err != nil {
+				re.log.Warnf(ctx, "Resource[%s] pre-discovery: failed to render targetCluster: %v",
+					resource.Name, err)
+				return NewExecutorError(PhaseResources, resource.Name, "failed to render targetCluster", err)
+			}
+			transportTarget = &desireclient.TransportContext{Partition: targetCluster}
 		}
 
 		discovered, err := re.discoverResource(ctx, resource, execCtx, transportTarget)
@@ -633,6 +674,15 @@ func (re *ResourceExecutor) executeResourceDelete(
 		execCtx.Resources[resource.Name] = nil
 		result.OperationReason = "resource already deleted or never existed"
 		re.log.Infof(ctx, "Resource[%s] delete: already deleted or never existed", resource.Name)
+
+		// For desire transport: the resource being gone means the applier already
+		// mirrored its absence via ReadDesire. Whatever DeleteDesire and ReadDesire
+		// keys are still in the store are orphans — clean them up so the partition
+		// doesn't accumulate stale desires across delete events.
+		if resource.IsDesireTransport() {
+			re.cleanupOrphanDesires(ctx, resource, execCtx, transportTarget)
+		}
+
 		re.metrics.RecordDeletion(resourceType, metrics.DeletionStatusSuccess)
 		re.metrics.ObserveDeletionDuration(resourceType, time.Since(startTime))
 		return result, nil
@@ -659,8 +709,12 @@ func (re *ResourceExecutor) executeResourceDelete(
 	}
 	deleteOpts := &transportclient.DeleteOptions{PropagationPolicy: propagationPolicy}
 
-	// Step 5: Delete via transport client
-	if err := re.client.DeleteResource(
+	// Step 5: Delete via transport client (use resolved transport for the resource)
+	deleteClient := re.resolveTransport(resource)
+	if deleteClient == nil {
+		deleteClient = re.client
+	}
+	if err := deleteClient.DeleteResource(
 		ctx, gvk, result.Namespace, result.ResourceName, deleteOpts, transportTarget,
 	); err != nil {
 		result.Status = StatusFailed
@@ -674,26 +728,34 @@ func (re *ResourceExecutor) executeResourceDelete(
 		return result, NewExecutorError(PhaseResources, resource.Name, "failed to delete resource", err)
 	}
 
-	// Step 6: Re-discover the resource after deletion to determine its actual state.
-	// - If NotFound: resource is truly gone (no finalizers, or K8s Background delete was instant).
-	//   Store nil so dependent resources can cascade in the same reconciliation.
-	// - If still present (e.g., deletionTimestamp set, finalizers running, or Maestro async):
-	//   Store the object so dependent resources wait for the next reconciliation.
-	postDeleteDiscovered, postDiscoverErr := re.discoverResource(ctx, resource, execCtx, transportTarget)
-	postIsNotFound := postDiscoverErr != nil && apierrors.IsNotFound(postDiscoverErr)
-	switch {
-	case postDiscoverErr != nil && !postIsNotFound:
-		// Non-fatal: log the error but don't fail the delete — the delete itself succeeded.
-		re.log.Debugf(ctx, "Resource[%s] post-delete discovery error (non-fatal): %v", resource.Name, postDiscoverErr)
-		execCtx.Resources[resource.Name] = discovered
-	case postDeleteDiscovered == nil || postIsNotFound:
-		// Resource is confirmed gone: dependent resources can proceed in this reconciliation.
-		execCtx.Resources[resource.Name] = nil
-		re.log.Debugf(ctx, "Resource[%s] confirmed deleted (post-delete discovery: not found)", resource.Name)
-	default:
-		// Resource still present (finalizers or async deletion): dependents wait for next reconciliation.
-		execCtx.Resources[resource.Name] = postDeleteDiscovered
-		re.log.Debugf(ctx, "Resource[%s] still present after delete (finalizers or async): dependents wait", resource.Name)
+	// Step 6: Determine whether the resource is actually gone.
+	//
+	// For desire transport: probe the DeleteDesire's own Successful condition,
+	// written by the applier when the K8s delete is confirmed. The ReadDesire's
+	// mirrored kubeContent lags behind reality after a delete, so we cannot rely
+	// on discoverResource here. On confirmation, clean up the DeleteDesire and
+	// ReadDesire keys so the next event reports Finalized=True to the API.
+	//
+	// For kubernetes transport: re-discover directly from the kube-apiserver.
+	if resource.IsDesireTransport() {
+		re.confirmDesireDelete(ctx, resource, execCtx, deleteClient, discovered, result, transportTarget)
+	} else {
+		postDeleteDiscovered, postDiscoverErr := re.discoverResource(ctx, resource, execCtx, transportTarget)
+		postIsNotFound := postDiscoverErr != nil && apierrors.IsNotFound(postDiscoverErr)
+		switch {
+		case postDiscoverErr != nil && !postIsNotFound:
+			// Non-fatal: log the error but don't fail the delete — the delete itself succeeded.
+			re.log.Debugf(ctx, "Resource[%s] post-delete discovery error (non-fatal): %v", resource.Name, postDiscoverErr)
+			execCtx.Resources[resource.Name] = discovered
+		case postDeleteDiscovered == nil || postIsNotFound:
+			// Resource is confirmed gone: dependent resources can proceed in this reconciliation.
+			execCtx.Resources[resource.Name] = nil
+			re.log.Debugf(ctx, "Resource[%s] confirmed deleted (post-delete discovery: not found)", resource.Name)
+		default:
+			// Resource still present (finalizers or async deletion): dependents wait for next reconciliation.
+			execCtx.Resources[resource.Name] = postDeleteDiscovered
+			re.log.Debugf(ctx, "Resource[%s] still present after delete (finalizers or async): dependents wait", resource.Name)
+		}
 	}
 
 	result.OperationReason = "lifecycle.delete.when evaluated to true"
@@ -706,6 +768,111 @@ func (re *ResourceExecutor) executeResourceDelete(
 	re.metrics.ObserveDeletionDuration(resourceType, time.Since(startTime))
 
 	return result, nil
+}
+
+// cleanupOrphanDesires removes the DeleteDesire and ReadDesire for a desire-transport
+// resource when the executor reaches the "resource already deleted or never existed"
+// branch. This handles the re-entry case: a prior delete event posted the DeleteDesire,
+// the applier confirmed the K8s delete and updated the ReadDesire's KubeContent to nil,
+// and on the next event pre-delete discovery returns NotFound — at which point the
+// DeleteDesire and ReadDesire are orphans.
+//
+// Name and namespace are taken from the resource's Discovery config (rendered with
+// execCtx.Params), matching how discoverResource looked them up. Resources that use
+// label-selector discovery are skipped: a single-name cleanup ID can't be derived
+// from a multi-match selector. Those leak in this path; revisit if any adapter
+// actually uses BySelectors with desire transport.
+func (re *ResourceExecutor) cleanupOrphanDesires(
+	ctx context.Context,
+	resource configloader.Resource,
+	execCtx *ExecutionContext,
+	transportTarget transportclient.TransportContext,
+) {
+	deleteClient := re.resolveTransport(resource)
+	dc, ok := deleteClient.(*desireclient.Client)
+	if !ok {
+		return
+	}
+	if resource.Discovery == nil || resource.Discovery.ByName == "" {
+		re.log.Debugf(ctx, "Resource[%s] skipping orphan desire cleanup: discovery does not use ByName", resource.Name)
+		return
+	}
+
+	namespace, err := utils.RenderTemplate(resource.Discovery.Namespace, execCtx.Params)
+	if err != nil {
+		re.log.Warnf(ctx, "Resource[%s] failed to render namespace for orphan cleanup: %v", resource.Name, err)
+		return
+	}
+	name, err := utils.RenderTemplate(resource.Discovery.ByName, execCtx.Params)
+	if err != nil {
+		re.log.Warnf(ctx, "Resource[%s] failed to render name for orphan cleanup: %v", resource.Name, err)
+		return
+	}
+
+	gvk := re.resolveGVK(resource)
+	if cleanupErr := dc.CleanupDeleteDesire(ctx, gvk, namespace, name, transportTarget); cleanupErr != nil {
+		re.log.Warnf(ctx, "Resource[%s] failed to cleanup delete desire (non-fatal): %v", resource.Name, cleanupErr)
+	}
+	if cleanupErr := dc.CleanupReadDesire(ctx, gvk, namespace, name, transportTarget); cleanupErr != nil {
+		re.log.Warnf(ctx, "Resource[%s] failed to cleanup read desire (non-fatal): %v", resource.Name, cleanupErr)
+	}
+}
+
+// confirmDesireDelete probes the DeleteDesire's Successful condition (written by the
+// applier when the K8s resource is confirmed gone) and, on confirmation, cleans up
+// the DeleteDesire and ReadDesire keys from the store.
+//
+// Resource map semantics:
+//   - confirmed (or DeleteDesire already absent): store nil so the CEL post-action
+//     gate evaluates !resources.?X.hasValue() to true → Finalized=True on the API.
+//   - not yet confirmed (applier hasn't polled, or finalizers still running): store
+//     the pre-delete object so dependents wait and the API sees Finalized=False.
+//     The next delete event will retry.
+//   - probe error: log non-fatal, treat as "not yet confirmed". The delete call
+//     itself already succeeded; we just don't know the cluster-side state yet.
+func (re *ResourceExecutor) confirmDesireDelete(
+	ctx context.Context,
+	resource configloader.Resource,
+	execCtx *ExecutionContext,
+	deleteClient transportclient.TransportClient,
+	discovered *unstructured.Unstructured,
+	result ResourceResult,
+	transportTarget transportclient.TransportContext,
+) {
+	dc, ok := deleteClient.(*desireclient.Client)
+	if !ok {
+		// Resource is configured as desire transport but the resolved client is
+		// not a *desireclient.Client. Fall back to "still present" so the next
+		// event re-runs the delete. Should never happen with valid config.
+		re.log.Warnf(ctx, "Resource[%s] desire transport resolved to non-desire client; treating as still present", resource.Name)
+		execCtx.Resources[resource.Name] = discovered
+		return
+	}
+
+	gvk := re.resolveGVK(resource)
+	confirmed, exists, err := dc.IsDeleteConfirmed(ctx, gvk, result.Namespace, result.ResourceName, transportTarget)
+	if err != nil {
+		re.log.Debugf(ctx, "Resource[%s] delete-desire status probe error (non-fatal): %v", resource.Name, err)
+		execCtx.Resources[resource.Name] = discovered
+		return
+	}
+
+	if !confirmed && exists {
+		re.log.Debugf(ctx, "Resource[%s] waiting for applier to confirm deletion", resource.Name)
+		execCtx.Resources[resource.Name] = discovered
+		return
+	}
+
+	// Confirmed gone (or DeleteDesire already cleaned up by a prior event).
+	execCtx.Resources[resource.Name] = nil
+	re.log.Debugf(ctx, "Resource[%s] confirmed deleted (applier reported Successful)", resource.Name)
+
+	if cleanupErr := dc.CleanupDeleteDesire(ctx, gvk, result.Namespace, result.ResourceName, transportTarget); cleanupErr != nil {
+		re.log.Warnf(ctx, "Resource[%s] failed to cleanup delete desire (non-fatal): %v", resource.Name, cleanupErr)
+	}
+	if cleanupErr := dc.CleanupReadDesire(ctx, gvk, result.Namespace, result.ResourceName, transportTarget); cleanupErr != nil {
+		re.log.Warnf(ctx, "Resource[%s] failed to cleanup read desire (non-fatal): %v", resource.Name, cleanupErr)
+	}
 }
 
 // recordResourceError sets execCtx.Adapter.ExecutionError (first error wins) and populates

@@ -63,8 +63,14 @@ type ExecutorConfig struct {
 	Config *configloader.Config
 	// APIClient is the HyperFleet API client
 	APIClient hyperfleetapi.Client
-	// TransportClient is the transport client for applying resources (kubernetes or maestro)
+	// TransportClient is the default transport client for applying resources.
+	// Used when a resource does not specify a named transport, or for
+	// backwards compatibility with the legacy transport config model.
 	TransportClient transportclient.TransportClient
+	// TransportRegistry holds named transport clients keyed by transport name.
+	// Resources reference transports by name via their Transport field.
+	// If nil or empty, the default TransportClient is used for all resources.
+	TransportRegistry map[string]transportclient.TransportClient
 	// Logger is the logger instance
 	Logger logger.Logger
 	// MetricsRecorder is the optional Prometheus metrics recorder

@@ -11,13 +11,17 @@ import (
 	"syscall"
 	"time"
 
+	"log/slog"
+
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/configloader"
+	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/desireclient"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/dryrun"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/executor"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/hyperfleetapi"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/k8sclient"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/maestroclient"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/transportclient"
+	redisstore "github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/desire/store/redis"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/health"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/logger"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/metrics"
@@ -381,21 +385,106 @@ func createMaestroClient(
 	return maestroclient.NewMaestroClient(ctx, config, log)
 }
 
+// createTransportRegistry builds a map of named transport clients from the
+// stores and transports config blocks. Returns nil if no transports are configured.
+func createTransportRegistry(
+	ctx context.Context,
+	config *configloader.Config,
+	log logger.Logger,
+) (map[string]transportclient.TransportClient, error) {
+	if len(config.Transports) == 0 {
+		return nil, nil
+	}
+
+	registry := make(map[string]transportclient.TransportClient)
+
+	for name, tc := range config.Transports {
+		switch tc.Type {
+		case configloader.TransportClientKubernetes:
+			client, err := createK8sClient(ctx, config.Clients.Kubernetes, log)
+			if err != nil {
+				return nil, fmt.Errorf("transport %q: %w", name, err)
+			}
+			registry[configloader.TransportClientKubernetes] = client
+
+		case configloader.TransportClientDesire:
+			if tc.Desire == nil {
+				return nil, fmt.Errorf("transport %q: desire config is required for type 'desire'", name)
+			}
+
+			specStoreCfg, ok := config.Stores[tc.Desire.SpecStore]
+			if !ok {
+				return nil, fmt.Errorf("transport %q: spec_store %q not found in stores config", name, tc.Desire.SpecStore)
+			}
+			statusStoreCfg, ok := config.Stores[tc.Desire.StatusStore]
+			if !ok {
+				return nil, fmt.Errorf("transport %q: status_store %q not found in stores config", name, tc.Desire.StatusStore)
+			}
+
+			specStore, err := createRedisStore(specStoreCfg)
+			if err != nil {
+				return nil, fmt.Errorf("transport %q spec store: %w", name, err)
+			}
+			statusStore, err := createRedisStore(statusStoreCfg)
+			if err != nil {
+				return nil, fmt.Errorf("transport %q status store: %w", name, err)
+			}
+
+			// Verify Redis connectivity
+			if err := specStore.Ping(ctx); err != nil {
+				return nil, fmt.Errorf("transport %q: failed to connect to spec store Redis: %w", name, err)
+			}
+			log.Infof(ctx, "Transport %q: connected to Redis spec store at %s", name, specStoreCfg.Redis.Address)
+
+			client, err := desireclient.NewClient(desireclient.Config{
+				SpecStore:   specStore,
+				StatusStore: statusStore,
+			}, slog.Default())
+			if err != nil {
+				return nil, fmt.Errorf("transport %q: %w", name, err)
+			}
+			registry[configloader.TransportClientDesire] = client
+			log.Infof(ctx, "Desire transport %q created successfully", name)
+
+		default:
+			return nil, fmt.Errorf("transport %q: unsupported type %q", name, tc.Type)
+		}
+	}
+
+	return registry, nil
+}
+
+// createRedisStore creates a Redis desire store from the store config.
+func createRedisStore(cfg configloader.StoreConfig) (*redisstore.Store, error) {
+	if cfg.Redis == nil {
+		return nil, fmt.Errorf("redis config is required for store type %q", cfg.Type)
+	}
+	return redisstore.New(redisstore.Config{
+		Address:  cfg.Redis.Address,
+		Password: cfg.Redis.Password,
+		DB:       cfg.Redis.DB,
+	})
+}
+
 // buildExecutor creates the executor with the given clients.
 func buildExecutor(
 	config *configloader.Config,
 	apiClient hyperfleetapi.Client,
 	tc transportclient.TransportClient,
+	registry map[string]transportclient.TransportClient,
 	log logger.Logger,
 	metricsRecorder *metrics.Recorder,
 ) (*executor.Executor, error) {
-	return executor.NewBuilder().
+	builder := executor.NewBuilder().
 		WithConfig(config).
 		WithAPIClient(apiClient).
 		WithTransportClient(tc).
 		WithLogger(log).
-		WithMetricsRecorder(metricsRecorder).
-		Build()
+		WithMetricsRecorder(metricsRecorder)
+	if registry != nil {
+		builder = builder.WithTransportRegistry(registry)
+	}
+	return builder.Build()
 }
 
 // -----------------------------------------------------------------------------
@@ -547,9 +636,21 @@ func runServe(flags *pflag.FlagSet) error {
 		return err
 	}
 
+	// Create transport registry for named transports (desire, etc.)
+	log.Info(ctx, "Creating transport registry...")
+	registry, err := createTransportRegistry(ctx, config, log)
+	if err != nil {
+		errCtx := logger.WithErrorField(ctx, err)
+		log.Errorf(errCtx, "Failed to create transport registry")
+		return fmt.Errorf("failed to create transport registry: %w", err)
+	}
+	if registry != nil {
+		log.Infof(ctx, "Transport registry created with %d transport(s)", len(registry))
+	}
+
 	// Build executor
 	log.Info(ctx, "Creating event executor...")
-	exec, err := buildExecutor(config, apiClient, tc, log, metricsRecorder)
+	exec, err := buildExecutor(config, apiClient, tc, registry, log, metricsRecorder)
 	if err != nil {
 		errCtx := logger.WithErrorField(ctx, err)
 		log.Errorf(errCtx, "Failed to create executor")
@@ -736,7 +837,7 @@ func runDryRun(flags *pflag.FlagSet) error {
 	}
 
 	// Build executor with mock clients (same builder as serve, no metrics in dry-run)
-	exec, err := buildExecutor(config, dryrunAPI, dryrunClient, log, nil)
+	exec, err := buildExecutor(config, dryrunAPI, dryrunClient, nil, log, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create executor: %w", err)
 	}

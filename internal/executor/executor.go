@@ -394,6 +394,13 @@ func (b *ExecutorBuilder) WithTransportClient(client transportclient.TransportCl
 	return b
 }
 
+// WithTransportRegistry sets named transport clients for per-resource transport resolution.
+// Resources reference transports by their client type (e.g., "desire").
+func (b *ExecutorBuilder) WithTransportRegistry(registry map[string]transportclient.TransportClient) *ExecutorBuilder {
+	b.config.TransportRegistry = registry
+	return b
+}
+
 // WithLogger sets the logger
 func (b *ExecutorBuilder) WithLogger(log logger.Logger) *ExecutorBuilder {
 	b.config.Logger = log

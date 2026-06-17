@@ -184,6 +184,11 @@ func (r *Resource) IsMaestroTransport() bool {
 	return r.GetTransportClient() == TransportClientMaestro
 }
 
+// IsDesireTransport returns true if this resource uses the desire transport client
+func (r *Resource) IsDesireTransport() bool {
+	return r.GetTransportClient() == TransportClientDesire
+}
+
 // HasManifestRef returns true if the manifest uses a ref (single file reference)
 func (r *Resource) HasManifestRef() bool {
 	if r == nil || r.Manifest == nil {

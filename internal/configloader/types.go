@@ -11,14 +11,16 @@ import (
 // Config is the unified configuration passed throughout the application.
 // Created by merging AdapterConfig (deployment) and AdapterTaskConfig (task).
 type Config struct {
-	Post          *PostConfig    `yaml:"post,omitempty"`
-	Log           LogConfig      `yaml:"log,omitempty"`
-	Adapter       AdapterInfo    `yaml:"adapter"`
-	Params        []Parameter    `yaml:"params,omitempty"`
-	Preconditions []Precondition `yaml:"preconditions,omitempty"`
-	Resources     []Resource     `yaml:"resources,omitempty"`
-	Clients       ClientsConfig  `yaml:"clients"`
-	DebugConfig   bool           `yaml:"debug_config,omitempty"`
+	Post          *PostConfig                    `yaml:"post,omitempty"`
+	Log           LogConfig                      `yaml:"log,omitempty"`
+	Adapter       AdapterInfo                    `yaml:"adapter"`
+	Params        []Parameter                    `yaml:"params,omitempty"`
+	Preconditions []Precondition                 `yaml:"preconditions,omitempty"`
+	Resources     []Resource                     `yaml:"resources,omitempty"`
+	Clients       ClientsConfig                  `yaml:"clients"`
+	Stores        map[string]StoreConfig         `yaml:"stores,omitempty"`
+	Transports    map[string]NamedTransportConfig `yaml:"transports,omitempty"`
+	DebugConfig   bool                           `yaml:"debug_config,omitempty"`
 }
 
 // Merge combines AdapterConfig (deployment) and AdapterTaskConfig (task) into a unified Config.
@@ -32,6 +34,8 @@ func Merge(adapterCfg *AdapterConfig, taskCfg *AdapterTaskConfig) *Config {
 	return &Config{
 		Adapter:       adapterCfg.Adapter,
 		Clients:       adapterCfg.Clients,
+		Stores:        adapterCfg.Stores,
+		Transports:    adapterCfg.Transports,
 		DebugConfig:   adapterCfg.DebugConfig,
 		Log:           adapterCfg.Log,
 		Params:        taskCfg.Params,
@@ -316,13 +320,24 @@ func (c *Condition) UnmarshalYAML(unmarshal func(interface{}) error) error {
 type TransportConfig struct {
 	// Maestro contains maestro-specific transport settings (required when Client is "maestro")
 	Maestro *MaestroTransportConfig `yaml:"maestro,omitempty"`
-	// Client is the transport client type: "kubernetes" or "maestro"
-	Client string `yaml:"client" validate:"required,oneof=kubernetes maestro"`
+	// Desire contains desire-specific transport settings (required when Client is "desire")
+	Desire *DesireResourceTransportConfig `yaml:"desire,omitempty"`
+	// Client is the transport client type: "kubernetes", "maestro", or "desire"
+	Client string `yaml:"client" validate:"required,oneof=kubernetes maestro desire"`
 }
 
 // MaestroTransportConfig contains maestro-specific transport settings
 type MaestroTransportConfig struct {
 	// TargetCluster is the name of the target cluster (consumer) for ManifestWork delivery
+	TargetCluster string `yaml:"target_cluster" validate:"required"`
+}
+
+// DesireResourceTransportConfig contains per-resource desire transport settings.
+// This is the resource-level config in the task config YAML, not the deployment-level
+// transport config (which is DesireTransportConfig in the adapter config).
+type DesireResourceTransportConfig struct {
+	// TargetCluster is the target cluster name, used as the partition key in the desire store.
+	// Supports Go template rendering (e.g., "{{ .placementClusterName }}").
 	TargetCluster string `yaml:"target_cluster" validate:"required"`
 }
 
@@ -487,10 +502,39 @@ func (ve *ValidationErrors) HasErrors() bool {
 // Contains infrastructure settings that can be overridden via environment variables
 // and CLI flags using Viper.
 type AdapterConfig struct {
-	Adapter     AdapterInfo   `yaml:"adapter" mapstructure:"adapter"`
-	Log         LogConfig     `yaml:"log,omitempty" mapstructure:"log"`
-	Clients     ClientsConfig `yaml:"clients" mapstructure:"clients"`
-	DebugConfig bool          `yaml:"debug_config,omitempty" mapstructure:"debug_config"`
+	Adapter     AdapterInfo              `yaml:"adapter" mapstructure:"adapter"`
+	Log         LogConfig                `yaml:"log,omitempty" mapstructure:"log"`
+	Clients     ClientsConfig            `yaml:"clients" mapstructure:"clients"`
+	Stores      map[string]StoreConfig   `yaml:"stores,omitempty" mapstructure:"stores"`
+	Transports  map[string]NamedTransportConfig `yaml:"transports,omitempty" mapstructure:"transports"`
+	DebugConfig bool                     `yaml:"debug_config,omitempty" mapstructure:"debug_config"`
+}
+
+// StoreConfig defines a desire store backend connection.
+// The Type field determines which sub-config is used.
+type StoreConfig struct {
+	Type  string            `yaml:"type" mapstructure:"type"`
+	Redis *RedisStoreConfig `yaml:"redis,omitempty" mapstructure:"redis"`
+}
+
+// RedisStoreConfig contains Redis-specific store configuration.
+type RedisStoreConfig struct {
+	Address  string `yaml:"address" mapstructure:"address"`
+	Password string `yaml:"password,omitempty" mapstructure:"password"`
+	DB       int    `yaml:"db,omitempty" mapstructure:"db"`
+}
+
+// NamedTransportConfig defines a named transport that resources can reference.
+type NamedTransportConfig struct {
+	Type   string                `yaml:"type" mapstructure:"type"`
+	Desire *DesireTransportConfig `yaml:"desire,omitempty" mapstructure:"desire"`
+}
+
+// DesireTransportConfig contains desire-specific transport settings.
+type DesireTransportConfig struct {
+	TargetCluster string `yaml:"target_cluster" mapstructure:"target_cluster"`
+	SpecStore     string `yaml:"spec_store" mapstructure:"spec_store"`
+	StatusStore   string `yaml:"status_store" mapstructure:"status_store"`
 }
 
 // ClientsConfig contains configuration for all external clients

@@ -2,17 +2,22 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/configloader"
+	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/desireclient"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/k8sclient"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/manifest"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/internal/transportclient"
+	"github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/desire"
+	memorystore "github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/desire/store/memory"
 	"github.com/openshift-hyperfleet/hyperfleet-adapter/pkg/logger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -1702,4 +1707,322 @@ func TestResourceExecutor_LifecycleDelete_BySelectors(t *testing.T) {
 	storedVal, exists := execCtx.Resources[resource.Name]
 	assert.True(t, exists, "nil sentinel should be in execCtx.Resources")
 	assert.Nil(t, storedVal, "nil stored when post-delete discovery finds no resources")
+}
+
+// --- Desire-transport delete tests ---
+//
+// These exercise executeResourceDelete → confirmDesireDelete with a real
+// desireclient.Client backed by the in-memory store. The applier is simulated
+// by pre-populating the DeleteDesire's Successful condition (or leaving it
+// empty) in the store before ExecuteAll runs.
+
+const desireTestPartition = "partition-1"
+
+// desireTestSetup builds an in-memory store + desireclient and pre-populates a
+// ReadDesire so pre-delete discovery returns `obj`. Returns the store, the
+// resource configured for desire transport, the partition, and the desire ID
+// used for the resource.
+func desireTestSetup(t *testing.T, obj *unstructured.Unstructured) (*memorystore.Store, *desireclient.Client, configloader.Resource, desire.DesireID) {
+	t.Helper()
+	store := memorystore.New()
+	client, err := desireclient.NewClient(desireclient.Config{
+		SpecStore:   store,
+		StatusStore: store,
+	}, nil)
+	require.NoError(t, err)
+
+	// Pre-populate ReadDesire with the live object so pre-delete discovery
+	// (which goes through the desire transport) returns it.
+	gvk := obj.GroupVersionKind()
+	id := desire.DesireID{
+		Partition: desireTestPartition,
+		Name:      "configmaps." + obj.GetNamespace() + "." + obj.GetName(),
+	}
+	kubeContent, err := json.Marshal(obj.Object)
+	require.NoError(t, err)
+	require.NoError(t, store.CreateReadDesire(context.Background(), &desire.ReadDesire{
+		ID: id,
+		Spec: desire.ReadDesireSpec{
+			TargetItem: desire.TargetItem{
+				Group:     gvk.Group,
+				Version:   gvk.Version,
+				Resource:  "configmaps",
+				Namespace: obj.GetNamespace(),
+				Name:      obj.GetName(),
+			},
+		},
+		Status: desire.ReadDesireStatus{KubeContent: kubeContent},
+	}))
+
+	resource := configloader.Resource{
+		Name: "test-resource",
+		Transport: &configloader.TransportConfig{
+			Client: "desire",
+			Desire: &configloader.DesireResourceTransportConfig{TargetCluster: desireTestPartition},
+		},
+		Manifest:  obj.Object,
+		Discovery: &configloader.DiscoveryConfig{Namespace: obj.GetNamespace(), ByName: obj.GetName()},
+		Lifecycle: &configloader.ResourceLifecycle{
+			Delete: &configloader.LifecycleDelete{
+				PropagationPolicy: "Background",
+				When:              &configloader.LifecycleWhen{Expression: "deleted_time != null"},
+			},
+		},
+	}
+	return store, client, resource, id
+}
+
+func newTestConfigMap() *unstructured.Unstructured {
+	return &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "v1",
+			"kind":       "ConfigMap",
+			"metadata": map[string]interface{}{
+				"name":      "test-cm",
+				"namespace": "default",
+			},
+		},
+	}
+}
+
+func TestResourceExecutor_LifecycleDelete_DesireTransport_Confirmed(t *testing.T) {
+	// Applier wrote Successful=True on the DeleteDesire → adapter must clean up
+	// both DeleteDesire and ReadDesire from the store and report nil so the CEL
+	// post-action gate evaluates Finalized=True.
+	store, client, resource, id := desireTestSetup(t, newTestConfigMap())
+
+	// Simulate the applier: pre-populate the DeleteDesire with Successful=True.
+	// desireclient.DeleteResource will swallow the resulting ErrVersionConflict
+	// when it tries to re-create the desire.
+	require.NoError(t, store.CreateDeleteDesire(context.Background(), &desire.DeleteDesire{
+		ID: id,
+		Spec: desire.DeleteDesireSpec{
+			TargetItem: desire.TargetItem{
+				Group: "", Version: "v1", Resource: "configmaps",
+				Namespace: "default", Name: "test-cm",
+			},
+		},
+		Status: desire.DesireStatus{
+			Conditions: []metav1.Condition{{
+				Type:   desire.ConditionTypeSuccessful,
+				Status: metav1.ConditionTrue,
+				Reason: desire.ReasonDeleted,
+			}},
+		},
+	}))
+
+	re := newResourceExecutor(&ExecutorConfig{
+		TransportClient:   client,
+		TransportRegistry: map[string]transportclient.TransportClient{"desire": client},
+		Logger:            logger.NewTestLogger(),
+	})
+
+	execCtx := NewExecutionContext(context.Background(), nil, nil)
+	execCtx.Params["deleted_time"] = testDeletedTime
+
+	results, err := re.ExecuteAll(context.Background(), []configloader.Resource{resource}, execCtx)
+
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, StatusSuccess, results[0].Status)
+	assert.Equal(t, manifest.OperationDelete, results[0].Operation)
+
+	// nil stored → Finalized=True on the next status PUT.
+	storedVal, exists := execCtx.Resources[resource.Name]
+	assert.True(t, exists, "nil sentinel should be in execCtx.Resources")
+	assert.Nil(t, storedVal, "nil stored when applier confirms deletion")
+
+	// Both keys gone from the store.
+	_, err = store.GetDeleteDesire(context.Background(), id)
+	assert.ErrorIs(t, err, desire.ErrNotFound, "DeleteDesire should be cleaned up after confirmation")
+	_, err = store.GetReadDesire(context.Background(), id)
+	assert.ErrorIs(t, err, desire.ErrNotFound, "ReadDesire should be cleaned up after confirmation")
+}
+
+func TestResourceExecutor_LifecycleDelete_DesireTransport_WaitingForApplier(t *testing.T) {
+	// Applier hasn't polled yet — the DeleteDesire exists (just created by the
+	// adapter's DeleteResource call) but carries no Successful condition.
+	// Expected: discovered stored (non-nil) → Finalized=False, desires left in
+	// place so the next event retries.
+	store, client, resource, id := desireTestSetup(t, newTestConfigMap())
+
+	re := newResourceExecutor(&ExecutorConfig{
+		TransportClient:   client,
+		TransportRegistry: map[string]transportclient.TransportClient{"desire": client},
+		Logger:            logger.NewTestLogger(),
+	})
+
+	execCtx := NewExecutionContext(context.Background(), nil, nil)
+	execCtx.Params["deleted_time"] = testDeletedTime
+
+	results, err := re.ExecuteAll(context.Background(), []configloader.Resource{resource}, execCtx)
+
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, StatusSuccess, results[0].Status)
+
+	// Non-nil stored → dependents wait, API sees Finalized=False, broker re-fires.
+	storedVal, exists := execCtx.Resources[resource.Name]
+	assert.True(t, exists, "resource should be in execCtx.Resources")
+	assert.NotNil(t, storedVal, "discovered object stored while waiting for applier confirmation")
+
+	// DeleteDesire created by DeleteResource is still there (no cleanup yet).
+	dd, err := store.GetDeleteDesire(context.Background(), id)
+	require.NoError(t, err)
+	assert.Empty(t, dd.Status.Conditions, "DeleteDesire has no status yet")
+
+	// ReadDesire still there for the next event to use.
+	_, err = store.GetReadDesire(context.Background(), id)
+	assert.NoError(t, err, "ReadDesire should be retained for the next reconciliation")
+}
+
+func TestResourceExecutor_LifecycleDelete_DesireTransport_OrphanCleanup(t *testing.T) {
+	// Re-entry case: pre-delete discovery returns NotFound because the applier
+	// already mirrored the resource as gone (ReadDesire KubeContent is nil), but
+	// the DeleteDesire and ReadDesire are still in the store. Expected: the
+	// early-return path cleans up both keys so the partition doesn't accumulate
+	// orphan desires across delete events.
+	store := memorystore.New()
+	client, err := desireclient.NewClient(desireclient.Config{
+		SpecStore:   store,
+		StatusStore: store,
+	}, nil)
+	require.NoError(t, err)
+
+	obj := newTestConfigMap()
+	gvk := obj.GroupVersionKind()
+	id := desire.DesireID{Partition: desireTestPartition, Name: "configmaps.default.test-cm"}
+	targetItem := desire.TargetItem{
+		Group: gvk.Group, Version: gvk.Version, Resource: "configmaps",
+		Namespace: obj.GetNamespace(), Name: obj.GetName(),
+	}
+
+	// ReadDesire with nil KubeContent — applier observed the resource is gone.
+	require.NoError(t, store.CreateReadDesire(context.Background(), &desire.ReadDesire{
+		ID:   id,
+		Spec: desire.ReadDesireSpec{TargetItem: targetItem},
+	}))
+	// DeleteDesire with Successful=True — applier confirmed the K8s delete.
+	require.NoError(t, store.CreateDeleteDesire(context.Background(), &desire.DeleteDesire{
+		ID:   id,
+		Spec: desire.DeleteDesireSpec{TargetItem: targetItem},
+		Status: desire.DesireStatus{
+			Conditions: []metav1.Condition{{
+				Type:   desire.ConditionTypeSuccessful,
+				Status: metav1.ConditionTrue,
+				Reason: desire.ReasonDeleted,
+			}},
+		},
+	}))
+
+	resource := configloader.Resource{
+		Name: "test-resource",
+		Transport: &configloader.TransportConfig{
+			Client: "desire",
+			Desire: &configloader.DesireResourceTransportConfig{TargetCluster: desireTestPartition},
+		},
+		Manifest:  obj.Object,
+		Discovery: &configloader.DiscoveryConfig{Namespace: obj.GetNamespace(), ByName: obj.GetName()},
+		Lifecycle: &configloader.ResourceLifecycle{
+			Delete: &configloader.LifecycleDelete{
+				PropagationPolicy: "Background",
+				When:              &configloader.LifecycleWhen{Expression: "deleted_time != null"},
+			},
+		},
+	}
+
+	re := newResourceExecutor(&ExecutorConfig{
+		TransportClient:   client,
+		TransportRegistry: map[string]transportclient.TransportClient{"desire": client},
+		Logger:            logger.NewTestLogger(),
+	})
+
+	execCtx := NewExecutionContext(context.Background(), nil, nil)
+	execCtx.Params["deleted_time"] = testDeletedTime
+
+	results, err := re.ExecuteAll(context.Background(), []configloader.Resource{resource}, execCtx)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, StatusSuccess, results[0].Status)
+
+	// nil stored → Finalized=True on the next status PUT.
+	storedVal, exists := execCtx.Resources[resource.Name]
+	assert.True(t, exists)
+	assert.Nil(t, storedVal, "nil stored on the already-deleted early-return path")
+
+	// Both orphan keys cleaned up.
+	_, err = store.GetDeleteDesire(context.Background(), id)
+	assert.ErrorIs(t, err, desire.ErrNotFound, "orphan DeleteDesire cleaned up on early-return")
+	_, err = store.GetReadDesire(context.Background(), id)
+	assert.ErrorIs(t, err, desire.ErrNotFound, "orphan ReadDesire cleaned up on early-return")
+}
+
+// --- IsDeleteConfirmed unit tests (cover edges the executor tests can't naturally hit) ---
+
+func TestDesireClient_IsDeleteConfirmed_Edges(t *testing.T) {
+	store := memorystore.New()
+	client, err := desireclient.NewClient(desireclient.Config{
+		SpecStore:   store,
+		StatusStore: store,
+	}, nil)
+	require.NoError(t, err)
+
+	gvk := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"}
+	target := &desireclient.TransportContext{Partition: desireTestPartition}
+	id := desire.DesireID{Partition: desireTestPartition, Name: "configmaps.default.test-cm"}
+
+	t.Run("not found is treated as already cleaned up", func(t *testing.T) {
+		confirmed, exists, err := client.IsDeleteConfirmed(context.Background(), gvk, "default", "test-cm", target)
+		require.NoError(t, err)
+		assert.False(t, confirmed)
+		assert.False(t, exists, "caller should treat !exists the same as confirmed")
+	})
+
+	t.Run("desire present without conditions is not confirmed", func(t *testing.T) {
+		require.NoError(t, store.CreateDeleteDesire(context.Background(), &desire.DeleteDesire{ID: id}))
+		t.Cleanup(func() { _ = store.DeleteDeleteDesire(context.Background(), id) })
+
+		confirmed, exists, err := client.IsDeleteConfirmed(context.Background(), gvk, "default", "test-cm", target)
+		require.NoError(t, err)
+		assert.False(t, confirmed)
+		assert.True(t, exists)
+	})
+
+	t.Run("Successful=False is not confirmed", func(t *testing.T) {
+		require.NoError(t, store.CreateDeleteDesire(context.Background(), &desire.DeleteDesire{
+			ID: id,
+			Status: desire.DesireStatus{
+				Conditions: []metav1.Condition{{
+					Type:   desire.ConditionTypeSuccessful,
+					Status: metav1.ConditionFalse,
+					Reason: desire.ReasonWaitingForDeletion,
+				}},
+			},
+		}))
+		t.Cleanup(func() { _ = store.DeleteDeleteDesire(context.Background(), id) })
+
+		confirmed, exists, err := client.IsDeleteConfirmed(context.Background(), gvk, "default", "test-cm", target)
+		require.NoError(t, err)
+		assert.False(t, confirmed)
+		assert.True(t, exists)
+	})
+
+	t.Run("Successful=True is confirmed", func(t *testing.T) {
+		require.NoError(t, store.CreateDeleteDesire(context.Background(), &desire.DeleteDesire{
+			ID: id,
+			Status: desire.DesireStatus{
+				Conditions: []metav1.Condition{{
+					Type:   desire.ConditionTypeSuccessful,
+					Status: metav1.ConditionTrue,
+					Reason: desire.ReasonDeleted,
+				}},
+			},
+		}))
+		t.Cleanup(func() { _ = store.DeleteDeleteDesire(context.Background(), id) })
+
+		confirmed, exists, err := client.IsDeleteConfirmed(context.Background(), gvk, "default", "test-cm", target)
+		require.NoError(t, err)
+		assert.True(t, confirmed)
+		assert.True(t, exists)
+	})
 }

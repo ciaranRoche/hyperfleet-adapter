@@ -79,6 +79,7 @@ const (
 const (
 	TransportClientKubernetes = "kubernetes"
 	TransportClientMaestro    = "maestro"
+	TransportClientDesire     = "desire"
 )
 
 // Resource field names
