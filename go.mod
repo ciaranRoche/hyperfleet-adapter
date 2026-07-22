@@ -193,4 +193,4 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.2 // indirect
 )
 
-replace github.com/openshift-hyperfleet/hyperfleet-broker => github.com/ciaranRoche/hyperfleet-broker v0.0.0-20260722104229-5e90ee9db069
+replace github.com/openshift-hyperfleet/hyperfleet-broker => github.com/ciaranRoche/hyperfleet-broker v0.0.0-20260722105756-911d23381785
