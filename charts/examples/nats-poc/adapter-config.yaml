@@ -1,0 +1,25 @@
+# Example HyperFleet Adapter deployment configuration
+adapter:
+  name: nats-poc-kubernetes
+  version: "0.2.0"
+
+# Log the full merged configuration after load (default: false)
+debug_config: false
+log:
+  level: info
+
+clients:
+  hyperfleet_api:
+    base_url: http://hyperfleet-api:8000
+    version: v1
+    timeout: 2s
+    retry_attempts: 3
+    retry_backoff: exponential
+
+  broker:
+    subscription_id: "hyperfleet-kubernetes-adapter"
+    topic: "hyperfleet-clusters"
+
+  kubernetes:
+    api_version: "v1"
+    #kube_config_path: PATH_TO_KUBECONFIG  # for local development

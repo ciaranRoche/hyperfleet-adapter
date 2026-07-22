@@ -1,0 +1,171 @@
+params:
+  - name: "clusterId"
+    source: "event.id"
+    type: "string"
+    required: true
+
+preconditions:
+  - name: "checkClusterState"
+    api_call:
+      method: "GET"
+      url: "/clusters/{{ .clusterId }}"
+      timeout: 10s
+    capture:
+      - name: "generation"
+        field: "generation"
+      - name: "clusterName"
+        field: "name"
+      - name: "is_deleting"
+        expression: "has(checkClusterState.deleted_time)"
+
+resources:
+  - name: namespace
+    transport:
+      client: "kubernetes"
+    manifest:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ .clusterId }}-k8s"
+        labels:
+          hyperfleet.io/cluster-id: "{{ .clusterId }}"
+          hyperfleet.io/cluster-name: "{{ .clusterName }}"
+          hyperfleet.io/managed-by: "{{ .adapter.name }}"
+          hyperfleet.io/resource-type: "namespace"
+        annotations:
+          hyperfleet.io/created-by: "hyperfleet-adapter"
+          hyperfleet.io/generation: "{{ .generation }}"
+    discovery:
+      by_name: '{{ .clusterId }}-k8s'
+    lifecycle:
+      delete:
+        propagationPolicy: Background
+        when:
+          expression: "is_deleting"
+  - name: "helloWorldJob"
+    transport:
+      client: "kubernetes"
+    manifest:
+      ref: "/etc/adapter/job.yaml"
+    discovery:
+      namespace: '{{ .clusterId }}-k8s'
+      by_selectors:
+        label_selector:
+          hyperfleet.io/resource-type: "job"
+          hyperfleet.io/cluster-id: "{{ .clusterId }}"
+    lifecycle:
+      delete:
+        propagationPolicy: Background
+        when:
+          expression: "is_deleting"
+
+post:
+  payloads:
+    - name: "clusterStatusPayload"
+      build:
+        adapter: "{{ .adapter.name }}"
+        conditions:
+          # Applied: job manifest was successfully applied
+          - type: "Applied"
+            status:
+              expression: |
+                has(resources.helloWorldJob) ? "True" : "False"
+            reason:
+              expression: |
+                has(resources.helloWorldJob) ? "JobApplied" : "JobPending"
+            message:
+              expression: |
+                has(resources.helloWorldJob)
+                  ? "Hello-world job applied successfully"
+                  : "Hello-world job is pending"
+          # Available: True when the job has completed successfully
+          - type: "Available"
+            status:
+              expression: |
+                has(resources.helloWorldJob) ?
+                  ( resources.?helloWorldJob.?status.?conditions.orValue([]).exists(c, c.type == "Complete")
+                    ? resources.helloWorldJob.status.conditions.filter(c, c.type == "Complete")[0].status
+                    : "False")
+                  : "False"
+            reason:
+              expression: |
+                resources.?helloWorldJob.?status.?conditions.orValue([]).exists(c, c.type == "Complete")
+                  ? "JobComplete"
+                  : resources.?helloWorldJob.?status.?conditions.orValue([]).exists(c, c.type == "Failed")
+                    ? "JobFailed"
+                    : resources.?helloWorldJob.?status.hasValue()
+                      ? "JobRunning"
+                      : "JobPending"
+            message:
+              expression: |
+                resources.?helloWorldJob.?status.?conditions.orValue([]).exists(c, c.type == "Complete")
+                  ? "Hello-world job completed successfully"
+                  : resources.?helloWorldJob.?status.?conditions.orValue([]).exists(c, c.type == "Failed")
+                    ? "Hello-world job failed"
+                    : resources.?helloWorldJob.?status.hasValue()
+                      ? "Hello-world job is running"
+                      : "Hello-world job is pending"
+          # Health: Adapter execution status (runtime)
+          - type: "Health"
+            status:
+              expression: |
+                adapter.?executionStatus.orValue("") == "success"
+                  && !adapter.?resourcesSkipped.orValue(false)
+                ? "True"
+                : "False"
+            reason:
+              expression: |
+                adapter.?executionStatus.orValue("") != "success"
+                ? "ExecutionFailed:" + adapter.?executionError.?phase.orValue("unknown")
+                : adapter.?resourcesSkipped.orValue(false)
+                  ? "ResourcesSkipped"
+                  : "Healthy"
+            message:
+              expression: |
+                adapter.?executionStatus.orValue("") != "success"
+                ? "Adapter failed at phase ["
+                    + adapter.?executionError.?phase.orValue("unknown")
+                    + "] step ["
+                    + adapter.?executionError.?step.orValue("unknown")
+                    + "]: "
+                    + adapter.?executionError.?message.orValue(adapter.?errorMessage.orValue("no details"))
+                : adapter.?resourcesSkipped.orValue(false)
+                  ? "Resources skipped: " + adapter.?skipReason.orValue("unknown reason")
+                  : "Adapter execution completed successfully"
+          # Finalized: True once the namespace is confirmed deleted during a deletion event
+          - type: "Finalized"
+            status:
+              expression: |
+                is_deleting
+                  && adapter.?executionStatus.orValue("") == "success"
+                  && !adapter.?resourcesSkipped.orValue(false)
+                  && !resources.?namespace.hasValue()
+                ? "True"
+                : "False"
+            reason:
+              expression: |
+                !is_deleting
+                ? ""
+                : !resources.?namespace.hasValue()
+                  ? "CleanupConfirmed"
+                  : "CleanupInProgress"
+            message:
+              expression: |
+                !is_deleting
+                ? ""
+                : !resources.?namespace.hasValue()
+                  ? "All resources deleted; cleanup confirmed"
+                  : "Deletion in progress; waiting for namespace to be removed"
+        observed_generation:
+          expression: "generation"
+        observed_time: "{{ now | date \"2006-01-02T15:04:05Z07:00\" }}"
+
+  post_actions:
+    - name: "reportClusterStatus"
+      api_call:
+        method: "PUT"
+        url: "/clusters/{{ .clusterId }}/statuses"
+        headers:
+          - name: "Content-Type"
+            value: "application/json"
+        body: "{{ .clusterStatusPayload }}"

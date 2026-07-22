@@ -1,0 +1,56 @@
+# NATS POC: kubernetes example adapter consuming from NATS JetStream.
+# Deploy from the charts/ directory so .Files.Get resolves the example files:
+#   helm upgrade --install adapter . -n hyperfleet -f examples/nats-poc/values.yaml
+adapterConfig:
+  create: true
+  files:
+    adapter-config.yaml: examples/nats-poc/adapter-config.yaml
+  log:
+    level: info
+
+adapterTaskConfig:
+  create: true
+  files:
+    task-config.yaml: examples/nats-poc/adapter-task-config.yaml
+    job.yaml: examples/nats-poc/adapter-task-resource-job.yaml
+
+broker:
+  create: true
+  type: nats
+  # Raw broker.yaml passthrough (consumed by the hyperfleet-broker library).
+  # ack_wait is raised for the demo: the handler waits on Job completion and
+  # PUTs status within one invocation.
+  yaml: |
+    broker:
+      type: nats
+      nats:
+        url: nats://nats.hyperfleet.svc.cluster.local:4222
+        create_stream_if_missing: true
+        storage: file
+        ack_wait: 120s
+    subscriber:
+      parallelism: 1
+
+image:
+  registry: localhost
+  repository: hyperfleet-adapter
+  pullPolicy: Never
+  tag: nats-poc
+
+env:
+  - name: NAMESPACE
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.namespace
+  - name: SERVICE_ACCOUNT
+    valueFrom:
+      fieldRef:
+        fieldPath: spec.serviceAccountName
+
+rbac:
+  resources:
+    - namespaces
+    - configmaps
+    - jobs
+    - jobs/status
+    - pods

@@ -292,7 +292,7 @@ Determine the broker type.
 broker.type must be set explicitly — inference from sub-keys is not supported.
 */}}
 {{- define "hyperfleet-adapter.brokerType" -}}
-{{- required "broker.type must be set to one of: googlepubsub, rabbitmq" .Values.broker.type -}}
+{{- required "broker.type must be set to one of: googlepubsub, rabbitmq, nats" .Values.broker.type -}}
 {{- end }}
 
 {{/*
