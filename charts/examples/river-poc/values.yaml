@@ -31,8 +31,8 @@ broker:
 image:
   registry: localhost
   repository: hyperfleet-adapter
-  pullPolicy: IfNotPresent
-  tag: latest
+  pullPolicy: Never
+  tag: river-poc
 
 env:
   - name: NAMESPACE
@@ -43,3 +43,11 @@ env:
     valueFrom:
       fieldRef:
         fieldPath: spec.serviceAccountName
+
+rbac:
+  resources:
+    - namespaces
+    - configmaps
+    - jobs
+    - jobs/status
+    - pods
