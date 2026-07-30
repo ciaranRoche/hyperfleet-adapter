@@ -1,5 +1,5 @@
 {{- if .Values.broker.create }}
-{{- $allowedTypes := list "googlepubsub" "rabbitmq" }}
+{{- $allowedTypes := list "googlepubsub" "rabbitmq" "river" }}
 {{- $brokerType := include "hyperfleet-adapter.brokerType" . }}
 {{- if and $brokerType (not (has $brokerType $allowedTypes)) }}
   {{- fail (printf "broker.type must be one of %s (got %q)" (join ", " $allowedTypes) $brokerType) }}

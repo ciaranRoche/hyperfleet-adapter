@@ -1,0 +1,45 @@
+# River POC example: the adapter consumes events from Postgres via the
+# broker library's river backend. Delivery of the workload itself stays on
+# the kubernetes transport, only the event bus changes.
+adapterConfig:
+  create: true
+  files:
+    adapter-config.yaml: examples/river-poc/adapter-config.yaml
+  log:
+    level: info
+
+adapterTaskConfig:
+  create: true
+  files:
+    task-config.yaml: examples/river-poc/adapter-task-config.yaml
+    job.yaml: examples/river-poc/adapter-task-resource-job.yaml
+
+broker:
+  create: true
+  type: river
+  # Raw broker.yaml passthrough: the river block is not templated by the
+  # chart, the full backend config rides here.
+  yaml: |
+    broker:
+      type: river
+      river:
+        dsn: postgres://broker:broker@river-postgres.hyperfleet.svc.cluster.local:5432/broker?sslmode=disable
+        create_schema_if_missing: true
+    subscriber:
+      parallelism: 1
+
+image:
+  registry: localhost
+  repository: hyperfleet-adapter
+  pullPolicy: IfNotPresent
+  tag: latest
+
+env:
+  - name: NAMESPACE
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.namespace
+  - name: SERVICE_ACCOUNT
+    valueFrom:
+      fieldRef:
+        fieldPath: spec.serviceAccountName

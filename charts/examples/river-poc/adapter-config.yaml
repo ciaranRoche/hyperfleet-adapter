@@ -1,0 +1,26 @@
+# River POC adapter deployment configuration.
+# Identical to the kubernetes example except the broker: events arrive
+# through the river (Postgres) backend instead of RabbitMQ or Pub/Sub.
+# Backend connection details live in broker.yaml, not here.
+adapter:
+  name: river-poc-kubernetes
+  version: "0.1.0"
+
+debug_config: false
+log:
+  level: info
+
+clients:
+  hyperfleet_api:
+    base_url: http://hyperfleet-api:8000
+    version: v1
+    timeout: 2s
+    retry_attempts: 3
+    retry_backoff: exponential
+
+  broker:
+    subscription_id: "river-poc-kubernetes"
+    topic: "hyperfleet-clusters"
+
+  kubernetes:
+    api_version: "v1"
